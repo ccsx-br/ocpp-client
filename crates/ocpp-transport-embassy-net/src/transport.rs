@@ -1,11 +1,17 @@
-//! OCPP-over-WebSocket transport over an `embassy_net::Stack`.
+//! OCPP-over-WebSocket transport over an `embassy_net::Stack`, with optional TLS (`wss://`).
 //!
 //! Uses `embedded-websocket`'s sans-io `WebSocket` core (not its `framer_async` module) driven
 //! directly over `embassy_net::tcp::{TcpReader, TcpWriter}` - see this crate's README for why,
 //! and for the buffering/fragmentation/close-handshake simplifications made here that haven't
 //! been validated against a real CSMS yet.
+//!
+//! When [`ConnectConfig::tls`] is set the TCP socket is wrapped in an `embedded-tls`
+//! [`TlsConnection`] *before* the WebSocket handshake, giving `wss://` with the same
+//! sans-io WebSocket layer. See [`TlsConfig`]/[`TlsVerify`] for the certificate-verification
+//! options and their limitations.
 
 use alloc::boxed::Box;
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -19,6 +25,11 @@ use embassy_net::tcp::{TcpReader, TcpSocket, TcpWriter};
 use embassy_net::{IpEndpoint, Stack};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex as EmbassyMutex;
+use embedded_io_async::{Read as AsyncRead, Write as AsyncWrite};
+use embedded_tls::{
+    Aes128GcmSha256, Certificate, CryptoProvider, CryptoRng, CryptoRngCore, NoClock, TlsConnection,
+    TlsContext, TlsError, TlsReader, TlsVerifier, TlsWriter, UnsecureProvider, pki::CertVerifier,
+};
 use embedded_websocket::{
     WebSocketClient, WebSocketCloseStatusCode, WebSocketOptions, WebSocketReceiveMessageType,
     WebSocketSendMessageType,
@@ -32,13 +43,61 @@ use rand_core::RngCore;
 /// RNG peripheral, a PRNG seeded from one at boot, etc.
 pub type RngFactory = Arc<dyn Fn() -> Box<dyn RngCore + Send> + Send + Sync>;
 
+/// How (and whether) the server certificate is verified when [`ConnectConfig::tls`] is set.
+#[derive(Clone, Copy)]
+pub enum TlsVerify<'a> {
+    /// **No verification at all** - the TLS layer encrypts but any certificate is accepted,
+    /// leaving the connection open to MITM. Acceptable for lab/bench bring-up against a
+    /// self-signed CSMS, not for production.
+    None,
+    /// The server's certificate chain must terminate at this DER-encoded root CA and the
+    /// certificate's CommonName must equal [`ConnectConfig::host`].
+    ///
+    /// Known limitations, inherited from `embedded-tls`'s `pki` verifier (the same one
+    /// `reqwless` uses for its `TlsVerify::Certificate`):
+    /// - **Validity period is not checked** - this transport targets microcontrollers
+    ///   without an RTC, so there is no trustworthy "now" to check against. Expired (or
+    ///   not-yet-valid) certificates that otherwise chain correctly are accepted.
+    /// - **Hostname is matched against the Subject CommonName only** - Subject
+    ///   Alternative Names are not consulted, so SAN-only certificates (no CN) fail.
+    /// - **The chain the server sends must walk back to the configured root** - missing
+    ///   intermediates are not fetched.
+    RootCaDer(&'a [u8]),
+}
+
+/// TLS settings for `wss://` endpoints. `None` on [`ConnectConfig::tls`] keeps the connection
+/// plaintext (`ws://`).
+#[derive(Clone)]
+pub struct TlsConfig {
+    /// Server-certificate verification mode - see [`TlsVerify`] for the trade-offs.
+    pub verify: TlsVerify<'static>,
+    /// TLS record read buffer, in bytes. Must fit one full encrypted TLS record *and* the
+    /// server's handshake flight (Certificate + friends, typically 4-8 KiB); 16640 is the
+    /// protocol maximum and the safe choice.
+    pub record_read_buffer_size: usize,
+    /// TLS record write buffer, in bytes. Writes are chunked to fit, so this can stay small;
+    /// it still has to hold the ClientHello, so don't go below ~1 KiB.
+    pub record_write_buffer_size: usize,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            verify: TlsVerify::None,
+            record_read_buffer_size: 16640,
+            record_write_buffer_size: 2048,
+        }
+    }
+}
+
 /// Everything needed to (re)dial one OCPP WebSocket connection. Cheap to clone (used by
 /// [`EmbassyNetReconnector`] to redial with the same settings after a disconnect).
 #[derive(Clone)]
 pub struct ConnectConfig {
     pub stack: Stack<'static>,
     pub remote: IpEndpoint,
-    /// Sent as the WebSocket handshake's `Host:` header.
+    /// Sent as the WebSocket handshake's `Host:` header, and - when [`Self::tls`] is set -
+    /// as the TLS SNI server name and the hostname the certificate is verified against.
     pub host: String,
     /// Sent as the WebSocket handshake's request path (e.g. `/ocpp/CP001`).
     pub path: String,
@@ -47,6 +106,11 @@ pub struct ConnectConfig {
     /// `ocpp-client`'s own WebSocket transport).
     pub sub_protocol: &'static str,
     pub rng_factory: RngFactory,
+    /// TLS settings for `wss://`. `None` = plaintext `ws://`.
+    ///
+    /// Budget roughly `record_read_buffer_size + record_write_buffer_size` (~19 KiB with
+    /// defaults) of extra heap per connection on top of the TCP socket buffers.
+    pub tls: Option<TlsConfig>,
     /// Byte size of the raw TCP receive buffer handed to `embassy_net::tcp::TcpSocket`.
     pub socket_rx_buffer_size: usize,
     /// Byte size of the raw TCP transmit buffer handed to `embassy_net::tcp::TcpSocket`.
@@ -77,6 +141,7 @@ impl ConnectConfig {
             path: path.into(),
             sub_protocol,
             rng_factory,
+            tls: None,
             socket_rx_buffer_size: 2048,
             socket_tx_buffer_size: 2048,
             handshake_buffer_size: 2048,
@@ -91,6 +156,9 @@ type SharedWebSocket =
 /// Dials `config.remote`, performs the WebSocket opening handshake, and returns boxed
 /// `TransportSink`/`TransportStream` halves ready for `ocpp_client::Client::from_transport` (or
 /// `_with_reconnect`, pairing with [`EmbassyNetReconnector`]).
+///
+/// When `config.tls` is set the TCP socket is upgraded to `embedded-tls` *before* the
+/// WebSocket handshake (i.e. `wss://`).
 ///
 /// Leaks the TCP socket and its buffers (`Box::leak`) to obtain the `'static` lifetime
 /// `TransportSink`/`TransportStream` require - standard practice for a connection meant to live
@@ -108,8 +176,177 @@ pub async fn connect(
 
     socket.connect(config.remote).await.map_err(boxed_error)?;
 
-    let (mut reader, mut writer) = socket.split();
+    let (reader, writer) = socket.split();
 
+    match config.tls.clone() {
+        Some(tls) => {
+            let (reader, writer) = open_tls(reader, writer, config, &tls).await?;
+            ws_handshake_and_build(reader, writer, config).await
+        }
+        None => ws_handshake_and_build(reader, writer, config).await,
+    }
+}
+
+/// Opens a TLS session over the TCP halves and returns `embedded_io_async` reader/writer
+/// halves of the *TLS* connection, ready to feed the same sans-io WebSocket layer the
+/// plaintext path uses.
+///
+/// `TlsConnection::split` requires the underlying socket to be `Clone` (both halves may
+/// generate raw-TCP traffic - e.g. a read path answering a KeyUpdate). `embassy_net`'s
+/// `TcpSocket` is not `Clone`, so the TCP halves live behind per-direction `Rc<Mutex>`s in
+/// [`TcpDuplex`]: reads and writes go to *different* mutexes, so a parked TLS read never
+/// blocks a concurrent TLS write (unlike a single mutex around the whole socket, which would
+/// deadlock). Both clones share each direction's mutex so a second concurrent borrow waits
+/// cooperatively rather than panicking.
+async fn open_tls(
+    reader: TcpReader<'static>,
+    writer: TcpWriter<'static>,
+    config: &ConnectConfig,
+    tls: &TlsConfig,
+) -> Result<
+    (
+        TlsReader<'static, TcpDuplex, Aes128GcmSha256>,
+        TlsWriter<'static, TcpDuplex, Aes128GcmSha256>,
+    ),
+    TransportError,
+> {
+    let duplex = TcpDuplex::new(reader, writer);
+    let rec_rx: &'static mut [u8] =
+        Box::leak(vec![0u8; tls.record_read_buffer_size].into_boxed_slice());
+    let rec_tx: &'static mut [u8] =
+        Box::leak(vec![0u8; tls.record_write_buffer_size].into_boxed_slice());
+    let connection: &'static mut TlsConnection<'_, TcpDuplex, Aes128GcmSha256> =
+        Box::leak(Box::new(TlsConnection::new(duplex, rec_rx, rec_tx)));
+
+    let tls_config = embedded_tls::TlsConfig::new().with_server_name(&config.host);
+    // TLS needs a CSPRNG for its ephemeral key-share - `RngFactory`'s contract already requires
+    // a real hardware RNG (WebSocket masking has the same requirement), so the adapter only
+    // adds the `CryptoRng` marker the TLS side asks for.
+    let rng = CryptoRngAdapter((config.rng_factory)());
+
+    match tls.verify {
+        TlsVerify::None => {
+            connection
+                .open(TlsContext::new(
+                    &tls_config,
+                    UnsecureProvider::new::<Aes128GcmSha256>(rng),
+                ))
+                .await
+                .map_err(boxed_error)?;
+        }
+        TlsVerify::RootCaDer(ca) => {
+            let tls_config = tls_config.with_ca(Certificate::X509(ca));
+            connection
+                .open(TlsContext::new(
+                    &tls_config,
+                    VerifiedProvider {
+                        rng,
+                        verifier: CertVerifier::new(),
+                    },
+                ))
+                .await
+                .map_err(boxed_error)?;
+        }
+    }
+
+    Ok(connection.split())
+}
+
+/// A `Clone`able `embedded_io_async` socket facade over `embassy_net`'s TCP halves, required
+/// by `TlsConnection::split` (see [`open_tls`]). Each direction gets its own mutex because
+/// `TlsReader` parks awaiting bytes while `TlsWriter` may need to flush a record.
+#[derive(Clone)]
+struct TcpDuplex {
+    rx: Rc<EmbassyMutex<CriticalSectionRawMutex, TcpReader<'static>>>,
+    tx: Rc<EmbassyMutex<CriticalSectionRawMutex, TcpWriter<'static>>>,
+}
+
+impl TcpDuplex {
+    fn new(reader: TcpReader<'static>, writer: TcpWriter<'static>) -> Self {
+        Self {
+            rx: Rc::new(EmbassyMutex::new(reader)),
+            tx: Rc::new(EmbassyMutex::new(writer)),
+        }
+    }
+}
+
+impl embedded_io_async::ErrorType for TcpDuplex {
+    type Error = embassy_net::tcp::Error;
+}
+
+impl AsyncRead for TcpDuplex {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        self.rx.lock().await.read(buf).await
+    }
+}
+
+impl AsyncWrite for TcpDuplex {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        self.tx.lock().await.write(buf).await
+    }
+
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        self.tx.lock().await.flush().await
+    }
+}
+
+/// Marks the firmware-provided RNG as a `CryptoRng` for embedded-tls's `CryptoProvider`.
+/// `RngFactory`'s contract is already "a real hardware RNG", so this adds no randomness
+/// guarantees - it only satisfies the trait bound.
+struct CryptoRngAdapter(Box<dyn RngCore + Send>);
+
+impl RngCore for CryptoRngAdapter {
+    fn next_u32(&mut self) -> u32 {
+        self.0.next_u32()
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.0.next_u64()
+    }
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        self.0.fill_bytes(dest);
+    }
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+        self.0.try_fill_bytes(dest)
+    }
+}
+
+// Justification documented on the struct: the factory contract already demands a CSPRNG.
+impl CryptoRng for CryptoRngAdapter {}
+
+/// `CryptoProvider` for certificate-verified connections (`TlsVerify::RootCaDer`): the
+/// firmware RNG plus `embedded-tls`'s `pki` verifier (chain + CommonName; expiry unchecked
+/// under `NoClock` - see [`TlsVerify`]'s docs).
+struct VerifiedProvider {
+    rng: CryptoRngAdapter,
+    verifier: CertVerifier<Aes128GcmSha256, NoClock, 4096>,
+}
+
+impl CryptoProvider for VerifiedProvider {
+    type CipherSuite = Aes128GcmSha256;
+    type Signature = p256::ecdsa::DerSignature;
+
+    fn rng(&mut self) -> impl CryptoRngCore {
+        &mut self.rng
+    }
+
+    fn verifier(&mut self) -> Result<&mut impl TlsVerifier<Self::CipherSuite>, TlsError> {
+        Ok(&mut self.verifier)
+    }
+}
+
+/// Runs the WebSocket opening handshake over `reader`/`writer` (TCP halves for `ws://`, TLS
+/// halves for `wss://`) and assembles the boxed `TransportSink`/`TransportStream` pair.
+async fn ws_handshake_and_build<R, W>(
+    mut reader: R,
+    mut writer: W,
+    config: &ConnectConfig,
+) -> Result<(Box<dyn TransportSink>, Box<dyn TransportStream>), TransportError>
+where
+    R: AsyncRead + 'static,
+    W: AsyncWrite + 'static,
+    R::Error: fmt::Debug + Send + Sync + 'static,
+    W::Error: fmt::Debug + Send + Sync + 'static,
+{
     let rng = (config.rng_factory)();
     let mut ws: WebSocketClient<Box<dyn RngCore + Send>> =
         WebSocketClient::<Box<dyn RngCore + Send>>::new_client(rng);
@@ -127,7 +364,7 @@ pub async fn connect(
         .client_connect(&options, &mut handshake_buf)
         .map_err(boxed_error)?;
     writer
-        .write(&handshake_buf[..request_len])
+        .write_all(&handshake_buf[..request_len])
         .await
         .map_err(boxed_error)?;
     writer.flush().await.map_err(boxed_error)?;
@@ -246,20 +483,24 @@ impl<F: Future> Future for AssertSendFuture<F> {
     }
 }
 
-struct EmbassyWsSink {
-    writer: TcpWriter<'static>,
+struct EmbassyWsSink<W> {
+    writer: W,
     ws: SharedWebSocket,
     tx_scratch: Box<[u8]>,
 }
 
-// SAFETY: `TcpWriter` holds a `&'static RefCell<..>` (via embassy-net's `Stack`), which is
-// `!Send` because `RefCell` is `!Sync` - but see `EmbassyNetReconnector`'s doc comment: under
-// embassy's single-core cooperative model there's no real concurrent access for that to guard
-// against. `TransportSink` only requires `Send` (not `Sync`), so this is the minimal assertion
-// needed - no `Sync` impl here.
-unsafe impl Send for EmbassyWsSink {}
+// SAFETY: `W` is a `TcpWriter` or `TlsWriter`, both of which hold `!Send` interior state
+// (`&'static RefCell<..>` via embassy-net's `Stack`, `Rc<..>` via `TcpDuplex`) - but see
+// `EmbassyNetReconnector`'s doc comment: under embassy's single-core cooperative model there's
+// no real concurrent access for that to guard against. `TransportSink` only requires `Send`
+// (not `Sync`), so this is the minimal assertion needed - no `Sync` impl here.
+unsafe impl<W> Send for EmbassyWsSink<W> {}
 
-impl TransportSink for EmbassyWsSink {
+impl<W> TransportSink for EmbassyWsSink<W>
+where
+    W: AsyncWrite + 'static,
+    W::Error: fmt::Debug + Send + Sync + 'static,
+{
     fn send<'a>(
         &'a mut self,
         frame: String,
@@ -276,7 +517,7 @@ impl TransportSink for EmbassyWsSink {
                 .map_err(boxed_error)?
             };
             self.writer
-                .write(&self.tx_scratch[..len])
+                .write_all(&self.tx_scratch[..len])
                 .await
                 .map_err(boxed_error)?;
             self.writer.flush().await.map_err(boxed_error)
@@ -301,7 +542,7 @@ impl TransportSink for EmbassyWsSink {
                 .map_err(boxed_error)?
             };
             self.writer
-                .write(&self.tx_scratch[..len])
+                .write_all(&self.tx_scratch[..len])
                 .await
                 .map_err(boxed_error)?;
             self.writer.flush().await.map_err(boxed_error)
@@ -326,7 +567,7 @@ impl TransportSink for EmbassyWsSink {
                 .map_err(boxed_error)?
             };
             self.writer
-                .write(&self.tx_scratch[..len])
+                .write_all(&self.tx_scratch[..len])
                 .await
                 .map_err(boxed_error)?;
             self.writer.flush().await.map_err(boxed_error)
@@ -347,7 +588,7 @@ impl TransportSink for EmbassyWsSink {
                 .map_err(boxed_error)?
             };
             self.writer
-                .write(&self.tx_scratch[..len])
+                .write_all(&self.tx_scratch[..len])
                 .await
                 .map_err(boxed_error)?;
             self.writer.flush().await.map_err(boxed_error)
@@ -355,12 +596,13 @@ impl TransportSink for EmbassyWsSink {
     }
 }
 
-// SAFETY: same reasoning as `EmbassyWsSink`'s `unsafe impl Send` above - `TcpReader` carries
-// the same `!Send` `&'static RefCell<..>`, sound under embassy's single-core cooperative model.
-unsafe impl Send for EmbassyWsStream {}
+// SAFETY: same reasoning as `EmbassyWsSink`'s `unsafe impl Send` above - `R` is a `TcpReader`
+// or `TlsReader`, carrying the same kind of `!Send` interior state, sound under embassy's
+// single-core cooperative model.
+unsafe impl<R> Send for EmbassyWsStream<R> {}
 
-struct EmbassyWsStream {
-    reader: TcpReader<'static>,
+struct EmbassyWsStream<R> {
+    reader: R,
     ws: SharedWebSocket,
     /// Raw bytes read straight off the socket, not yet handed to the websocket decoder.
     socket_buf: Box<[u8]>,
@@ -374,7 +616,11 @@ struct EmbassyWsStream {
     accumulated: Vec<u8>,
 }
 
-impl TransportStream for EmbassyWsStream {
+impl<R> TransportStream for EmbassyWsStream<R>
+where
+    R: AsyncRead + 'static,
+    R::Error: fmt::Debug + Send + Sync + 'static,
+{
     fn recv<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<Option<TransportEvent>, TransportError>> + Send + 'a>>
