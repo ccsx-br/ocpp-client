@@ -503,10 +503,18 @@ where
 
     let mut handshake_buf = vec![0u8; config.handshake_buffer_size];
     let sub_protocols = [config.sub_protocol];
+    // `embedded-websocket` always emits an `Origin` header, and a present-but-empty
+    // one fails origin validation in Spring-based CSMSes (steve answers 403).
+    // A well-formed `scheme://host` passes — the value is informational here.
+    let origin = alloc::format!(
+        "{}://{}",
+        if config.tls.is_some() { "https" } else { "http" },
+        config.host
+    );
     let options = WebSocketOptions {
         path: &config.path,
         host: &config.host,
-        origin: "",
+        origin: &origin,
         sub_protocols: Some(&sub_protocols),
         additional_headers: None,
     };
